@@ -1,31 +1,32 @@
-// Nabaha Edge — Local SIP bridge for PBX integration.
+// Nabaha Edge — Local SIP-to-WebRTC bridge for PBX integration.
 //
-// Runs on customer's LAN, accepts SIP from PBX, tunnels to Nabaha Cloud.
+// Single binary, works on Windows/Linux/Mac. No external dependencies.
+// Accepts SIP from PBX on LAN, tunnels audio to Nabaha Cloud via WebRTC.
 //
 // Usage:
 //
-//	nabaha-edge --token nt_xxxxx          (run with token)
-//	nabaha-edge setup --token nt_xxxxx    (save token to config)
-//	NABAHA_EDGE_TOKEN=nt_xxxxx nabaha-edge (via env var)
+//	nabaha-edge --token nt_xxxxx
+//	nabaha-edge setup --token nt_xxxxx
+//	NABAHA_EDGE_TOKEN=nt_xxxxx nabaha-edge
 package main
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"os"
 	"os/signal"
 	"syscall"
 
+	"github.com/osamanoman/nabaha-edge/internal/bridge"
 	"github.com/osamanoman/nabaha-edge/internal/config"
 	"github.com/osamanoman/nabaha-edge/internal/heartbeat"
-	"github.com/osamanoman/nabaha-edge/internal/sip"
 )
 
 func main() {
 	log.SetFlags(log.Ldate | log.Ltime | log.Lmsgprefix)
 	log.SetPrefix("[nabaha-edge] ")
 
-	// Parse token from env or args
 	token := os.Getenv("NABAHA_EDGE_TOKEN")
 	apiBase := os.Getenv("NABAHA_API_BASE")
 	isSetup := false
@@ -54,15 +55,12 @@ func main() {
 			}
 		}
 	}
-
 	if apiBase == "" {
 		apiBase = config.DefaultAPIBase
 	}
 
 	if token == "" {
-		fmt.Println("╔══════════════════════════════════════════════╗")
-		fmt.Println("║         Nabaha Edge — SIP Bridge             ║")
-		fmt.Println("╚══════════════════════════════════════════════╝")
+		fmt.Println("Nabaha Edge — Local SIP Bridge")
 		fmt.Println()
 		fmt.Println("Usage:")
 		fmt.Println("  nabaha-edge --token nt_xxxxx")
@@ -90,11 +88,10 @@ func main() {
 
 	// --- Startup ---
 	log.Println("starting...")
-	preview := token[:7] + "****" + token[len(token)-4:]
-	log.Printf("token: %s", preview)
+	log.Printf("token: %s****%s", token[:7], token[len(token)-4:])
 	log.Printf("api: %s", apiBase)
 
-	// Step 1: Fetch remote config
+	// Fetch remote config
 	log.Println("fetching config from Nabaha Cloud...")
 	remoteCfg, err := config.FetchRemoteConfig(token, apiBase)
 	if err != nil {
@@ -104,44 +101,29 @@ func main() {
 	log.Printf("SIP port: %d", remoteCfg.SIPPort)
 	log.Printf("calls allowed: %v", remoteCfg.CallsAllowed)
 
-	// Step 2: Write SIP config
-	sipConfigPath, err := sip.WriteSIPConfig(remoteCfg)
-	if err != nil {
-		log.Fatalf("Failed to write SIP config: %v", err)
-	}
+	// Start heartbeat in background
+	stopHeartbeat := make(chan struct{})
+	go heartbeat.Start(token, apiBase, stopHeartbeat)
 
-	// Step 3: Find and start LiveKit SIP binary
-	sipBinary, err := sip.FindSIPBinary()
-	if err != nil {
-		log.Printf("WARNING: %v", err)
-		log.Println("SIP bridge will not start — install livekit-sip binary")
-		log.Println("Running in heartbeat-only mode...")
-	} else {
-		log.Printf("SIP binary: %s", sipBinary)
-		cmd, err := sip.StartSIPServer(sipBinary, sipConfigPath)
-		if err != nil {
-			log.Fatalf("Failed to start SIP server: %v", err)
+	// Start SIP→WebRTC bridge
+	ctx, cancel := context.WithCancel(context.Background())
+	b := bridge.New(remoteCfg, token, apiBase)
+
+	go func() {
+		if err := b.Start(ctx); err != nil {
+			log.Printf("bridge error: %v", err)
 		}
-		defer func() {
-			if cmd.Process != nil {
-				log.Println("stopping SIP server...")
-				cmd.Process.Kill()
-			}
-		}()
-	}
+	}()
 
-	// Step 4: Start heartbeat in background
-	stopCh := make(chan struct{})
-	go heartbeat.Start(token, apiBase, stopCh)
-
-	// Step 5: Wait for shutdown signal
 	log.Println("ready — accepting SIP calls on port 5060")
 	log.Println("press Ctrl+C to stop")
 
+	// Wait for shutdown
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 	<-sigCh
 
 	log.Println("shutting down...")
-	close(stopCh)
+	cancel()
+	close(stopHeartbeat)
 }
